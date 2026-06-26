@@ -17,6 +17,20 @@ from .const import PSEUDO_METER_ID
 # match on a string of non-whitespace characters.
 ACCOUNT_NUMBER_RE = re.compile(r"^\S+$")
 
+# Some WaterSmart portals (and the WAFs/CDNs in front of them) reject or serve
+# different content to non-browser HTTP clients. Home Assistant's shared aiohttp
+# session sends a non-browser User-Agent, which causes the login POST to fail
+# authentication even with valid credentials. Send browser-like headers on the
+# requests this client makes so the authenticated flow looks like a browser.
+_DEFAULT_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
 
 def _authenticated[F: Callable[..., Any], ReturnT](func: F) -> F:
     @functools.wraps(func)
@@ -160,7 +174,8 @@ class WaterSmartClient:
         session = self._session
         hostname = self._hostname
         response = await session.get(
-            f"https://{hostname}.watersmart.com/index.php/rest/v1/Chart/RealTimeChart"
+            f"https://{hostname}.watersmart.com/index.php/rest/v1/Chart/RealTimeChart",
+            headers=_DEFAULT_HEADERS,
         )
         response_json: UsageHistoryPayload = await response.json()
 
@@ -183,6 +198,7 @@ class WaterSmartClient:
                 "email": self._username,
                 "password": self._password,
             },
+            headers=_DEFAULT_HEADERS,
         )
         login_response_text = await login_response.text()
         soup = BeautifulSoup(login_response_text, "html.parser")
@@ -203,6 +219,7 @@ class WaterSmartClient:
                     "email": self._username,
                     "password": self._password,
                 },
+                headers=_DEFAULT_HEADERS,
             )
             login_response_text = await login_response.text()
             soup = BeautifulSoup(login_response_text, "html.parser")
