@@ -282,6 +282,7 @@ async def test_multimeter_login_success(
             "email": "test@home-assistant.io",
             "password": "Passw0rd",
         },
+        headers=ANY,
     )
 
 
