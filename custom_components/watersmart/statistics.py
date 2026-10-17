@@ -1,0 +1,257 @@
+"""WaterSmart long-term-statistics import.
+
+Home Assistant records a consumption series as a running total: each hourly row
+carries that hour's own usage in ``state`` and the cumulative total of every
+hour up to and including it in ``sum``. WaterSmart reports each hour on its own,
+so the hourly values have to be accumulated before the recorder will take them.
+
+Two terms recur below. *Folding* is that accumulation -- turning per-hour
+gallons into rows whose ``sum`` is the running total. An *anchor* is the row a
+fold resumes from, identified by its hour and the running total reached there.
+
+A cold start folds the whole history from zero. A warm refresh anchors on an
+already-recorded hour far enough back to be settled and folds only the hours
+after it, so the recent hours WaterSmart still restates are recomputed while
+older rows are left alone.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
+import datetime as dt
+import functools
+from operator import itemgetter
+from typing import Any, cast
+
+from homeassistant.components.recorder import get_instance
+from homeassistant.components.recorder.models import (
+    StatisticData,
+    StatisticMeanType,
+    StatisticMetaData,
+)
+from homeassistant.components.recorder.statistics import get_metadata
+from homeassistant.const import UnitOfVolume
+from homeassistant.core import HomeAssistant
+from homeassistant.util import slugify
+from homeassistant.util.dt import get_default_time_zone
+from homeassistant.util.unit_conversion import VolumeConverter
+
+from .client import UsageRecord
+from .const import DOMAIN, PSEUDO_METER_ID
+from .types import WaterSmartConfigEntry
+
+# A warm refresh re-folds the trailing window of buckets so late upstream
+# corrections are absorbed without rewriting the whole series.
+REFOLD_WINDOW = dt.timedelta(hours=48)
+# The anchor lookup spans a 25h window so a bucket landing exactly on the
+# cutoff is still found.
+ANCHOR_LOOKBACK = dt.timedelta(hours=24)
+# ``unit_class`` names the converter the recorder uses to render the series in
+# the user's preferred volume unit. The recorder gained the field in HA
+# 2025.11.0 and builds its metadata row with ``StatisticsMeta(**metadata)``, so
+# an older recorder raises TypeError on the key instead of ignoring it. Probe
+# for the field rather than pinning a minimum HA version; delete the probe once
+# the supported floor reaches 2025.11.0.
+_SUPPORTS_UNIT_CLASS = "unit_class" in StatisticMetaData.__annotations__
+
+
+def _utc_from_epoch(timestamp: float) -> dt.datetime:
+    """Interpret a recorder epoch timestamp as a UTC datetime.
+
+    ``StatisticsRow["start"]`` is a true epoch: the recorder stores the instant.
+    The fold works in UTC datetimes throughout.
+
+    This is *not* how the client's ``read_datetime`` is read -- see
+    :func:`_hour_start_utc`.
+
+    Returns:
+        The timestamp as a timezone-aware UTC datetime.
+    """
+    return dt.datetime.fromtimestamp(timestamp, tz=dt.UTC)
+
+
+def _hour_start_utc(read_datetime: float) -> dt.datetime:
+    """Convert a reading's ``read_datetime`` to the UTC instant its hour begins.
+
+    ``read_datetime`` is not a true epoch. The portal encodes the utility's
+    local wall clock as though it were UTC, so the number's digits *are* local
+    time and the value has to be relabeled rather than converted -- the same
+    reading ``coordinator._from_timestamp`` applies.
+
+    The raw series shows this directly: reads are 3600s apart except across DST,
+    where an hour is skipped each spring-forward and repeated each fall-back. A
+    true epoch series of hourly reads would be uniformly spaced.
+
+    Truncation happens in local time, before conversion, so an hour bucket is
+    the utility's hour on utilities whose offset is not a whole number of hours.
+
+    Returns:
+        The start of the reading's hour, as a timezone-aware UTC datetime.
+    """
+    local = dt.datetime.fromtimestamp(read_datetime, tz=dt.UTC).replace(
+        tzinfo=get_default_time_zone()
+    )
+    return local.replace(minute=0, second=0, microsecond=0).astimezone(dt.UTC)
+
+
+def statistic_id_for(entry_id: str, meter_id: str = PSEUDO_METER_ID) -> str:
+    """Return the external statistic id for a meter of this config entry.
+
+    HA config-entry ids are uppercase ULIDs, but HA requires statistic ids to
+    be slugs (lowercase). ULIDs are case-insensitive Crockford base32, so
+    lowercasing is lossless and keeps the statistic id 1:1 with the entry.
+
+    A single-meter account (the pseudo meter) uses the bare entry id; each meter
+    of a multi-meter account gets its own series suffixed with the meter id.
+    """
+    base = f"{DOMAIN}:{entry_id.lower()}"
+    if meter_id == PSEUDO_METER_ID:
+        return base
+    return f"{base}_{slugify(meter_id)}"
+
+
+def metadata_for(entry_id: str, meter_id: str, name: str) -> StatisticMetaData:
+    """Build the external-statistics metadata for a meter of this config entry.
+
+    Water usage is an accumulated-quantity statistic: each hour's value is the
+    total consumed during that hour. ``has_sum=True``; ``mean_type`` is
+    ``StatisticMeanType.NONE`` because there are no underlying instantaneous
+    observations to average. ``unit_class`` is set only on recorders that
+    accept it (see :data:`_SUPPORTS_UNIT_CLASS`).
+
+    Returns:
+        Metadata describing the external-statistics series for the entry.
+    """
+    # Assembled as a plain mapping because the accepted keys vary by HA version.
+    metadata: dict[str, Any] = {
+        "mean_type": StatisticMeanType.NONE,
+        "has_sum": True,
+        "name": f"Water consumption ({name})",
+        "source": DOMAIN,
+        "statistic_id": statistic_id_for(entry_id, meter_id),
+        "unit_of_measurement": UnitOfVolume.GALLONS,
+    }
+    if _SUPPORTS_UNIT_CLASS:
+        metadata["unit_class"] = VolumeConverter.UNIT_CLASS
+    return cast("StatisticMetaData", metadata)
+
+
+def bucket_records(
+    records: Iterable[UsageRecord],
+) -> list[tuple[dt.datetime, float]]:
+    """Group records by the hour they were read in, keyed by UTC instant.
+
+    Drops records with ``gallons is None``; sums multiple records that fall
+    within the same hour (sub-hour timestamp jitter in the source data can place
+    two readings in one hour); returns the result sorted chronologically.
+
+    Returns:
+        ``(hour_start_utc, gallons)`` pairs sorted chronologically.
+    """
+    buckets: dict[dt.datetime, float] = {}
+    for record in records:
+        gallons = record["gallons"]
+        if gallons is None:
+            continue
+        start = _hour_start_utc(record["read_datetime"])
+        buckets[start] = buckets.get(start, 0.0) + gallons
+    return sorted(buckets.items())
+
+
+def fold_cumulative(
+    buckets: Iterable[tuple[dt.datetime, float]],
+    anchor: Anchor,
+) -> list[StatisticData]:
+    """Fold per-hour gallons after ``anchor`` into cumulative-sum statistic rows.
+
+    Buckets at or before ``anchor.start`` are dropped; the rest accumulate onto
+    ``anchor.sum`` to form each row's ``sum``. Each row's ``state`` is that
+    hour's own gallons, not the running total: HA's external-statistics
+    convention pairs a per-period ``state`` with the cumulative ``sum`` (the
+    Energy dashboard reads ``sum``, and the statistics UI derives each period's
+    change from consecutive sums while ``state`` records the period value).
+
+    Returns:
+        Cumulative-sum statistic rows in chronological order.
+    """
+    rows: list[StatisticData] = []
+    running = anchor.sum
+    for start, gallons in buckets:
+        if anchor.start is not None and start <= anchor.start:
+            continue
+        running += gallons
+        rows.append(StatisticData(start=start, state=gallons, sum=running))
+    return rows
+
+
+@dataclass(frozen=True)
+class Anchor:
+    """The cumulative state a fold continues from.
+
+    ``start`` is ``None`` on a cold start, meaning every bucket is folded;
+    otherwise only buckets strictly after ``start`` are folded onto ``sum``.
+    """
+
+    start: dt.datetime | None
+    sum: float
+
+
+# A cold start (no prior statistics row) folds the whole series from zero.
+COLD_START = Anchor(start=None, sum=0.0)
+
+
+def anchor_window(last_row: Mapping[str, Any]) -> tuple[dt.datetime, dt.datetime]:
+    """Return the time span to search for a warm-refresh anchor row.
+
+    The window ends one refold-window before ``last_row`` and reaches back a
+    further lookback span so a bucket on the cutoff boundary is still found.
+
+    Returns:
+        ``(window_start, window_end)`` for ``statistics_during_period``.
+    """
+    cutoff = _utc_from_epoch(last_row["start"]) - REFOLD_WINDOW
+    return cutoff - ANCHOR_LOOKBACK, cutoff + dt.timedelta(hours=1)
+
+
+def select_anchor(window_rows: Sequence[Mapping[str, Any]]) -> Anchor:
+    """Choose the anchor a warm refresh folds the trailing window onto.
+
+    Anchors on the most recent statistics row inside :func:`anchor_window`. An
+    empty window -- a series shorter than the refold window, or a gap in
+    recorded statistics there -- has no row to anchor on, so the whole series
+    is re-folded from zero. Folding from zero is the correct fallback: a
+    partial fold needs an anchor sum paired with the matching anchor start, and
+    no row supplies that pair. Anchoring on the last recorded row instead would
+    skip every bucket in the trailing window, silently dropping late upstream
+    corrections.
+
+    Returns:
+        The anchor to fold onto.
+    """
+    if not window_rows:
+        return COLD_START
+    row = max(window_rows, key=itemgetter("start"))
+    return Anchor(start=_utc_from_epoch(row["start"]), sum=row["sum"] or 0.0)
+
+
+async def async_clear(hass: HomeAssistant, entry: WaterSmartConfigEntry) -> None:
+    """Clear every external statistics series for an entry.
+
+    The meters an entry had are not known once it is unloaded, so the series
+    are found by their ``statistic_id`` prefix among this integration's
+    metadata. ``async_clear_statistics`` schedules work on the recorder thread
+    and returns immediately, so there is nothing further to await.
+    """
+    instance = get_instance(hass)
+    metadata = await instance.async_add_executor_job(
+        functools.partial(get_metadata, hass, statistic_source=DOMAIN)
+    )
+    base = statistic_id_for(entry.entry_id)
+    statistic_ids = [
+        statistic_id
+        for statistic_id in metadata
+        if statistic_id == base or statistic_id.startswith(f"{base}_")
+    ]
+    if statistic_ids:
+        instance.async_clear_statistics(statistic_ids)

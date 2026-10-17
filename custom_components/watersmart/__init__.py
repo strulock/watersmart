@@ -10,6 +10,7 @@ from .client import WaterSmartClient
 from .const import DOMAIN
 from .coordinator import WaterSmartUpdateCoordinator
 from .services import async_setup_services
+from .statistics import async_clear as async_clear_statistics
 from .types import WaterSmartConfigEntry, WaterSmartData
 
 PLATFORMS: list[Platform] = [Platform.SENSOR]
@@ -55,6 +56,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: WaterSmartConfigEntry) -
         hostname,
         username,
         meters=available_meters,
+        entry_id=entry.entry_id,
     )
     await coordinator.async_config_entry_first_refresh()
 
@@ -76,3 +78,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: WaterSmartConfigEntry) 
         If the unload was successful.
     """
     return bool(await hass.config_entries.async_unload_platforms(entry, PLATFORMS))
+
+
+async def async_remove_entry(hass: HomeAssistant, entry: WaterSmartConfigEntry) -> None:
+    """Clear the integration's external statistics series on entry removal."""
+    await async_clear_statistics(hass, entry)

@@ -52,9 +52,42 @@ def fixture_loader():
 
 
 @pytest.fixture(autouse=True)
-def auto_enable_custom_integrations(enable_custom_integrations):
-    """Enable custom integrations."""
+def auto_enable_custom_integrations(recorder_mock, enable_custom_integrations):
+    """Enable custom integrations, with the recorder set up first.
+
+    ``recorder_mock`` is ordered before ``enable_custom_integrations`` (which
+    pulls in ``hass``) so the recorder's fixtures initialize ahead of the hass
+    fixture, as they require. The integration declares ``recorder`` as a
+    manifest dependency, so HA refuses to set it up without the recorder
+    present.
+    """
     return
+
+
+@pytest.fixture(autouse=True)
+async def unload_entries_before_recorder_teardown(
+    auto_enable_custom_integrations, hass: HomeAssistant
+):
+    """Stop the coordinator before the recorder disposes its database.
+
+    ``recorder_mock`` requests ``hass``, so hass is set up first and torn down
+    last: the recorder closes its SQLite connection while the loop is still live
+    and the coordinator's refresh timer is still armed. A refresh landing in that
+    window runs a recorder query against a connection being freed underneath it,
+    which segfaults the interpreter rather than raising.
+
+    Home Assistant never produces that order itself -- ``async_stop`` sets
+    ``is_stopping``, which parks scheduled refreshes, two shutdown stages before
+    the recorder closes. Unloading the entry here restores the ordering the
+    integration actually runs under.
+
+    Requesting ``auto_enable_custom_integrations`` places this fixture after the
+    recorder in setup, and so ahead of it in teardown.
+    """
+    yield
+    for entry in hass.config_entries.async_entries(DOMAIN):
+        await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
 
 
 class MockAiohttpResponse:

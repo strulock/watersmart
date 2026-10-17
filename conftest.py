@@ -12,33 +12,33 @@ block. This is Windows-only and has no effect on Linux/macOS CI.
 import sys
 
 if sys.platform == "win32":
-    import _socket
     import socket as _socket_module
 
     _RealSocket = _socket_module.socket
 
     def _socketpair_win(
-        family=_socket_module.AF_INET,
-        type=_socket_module.SOCK_STREAM,  # noqa: A002
-        proto=0,
-    ):
+        family: int = _socket_module.AF_INET,
+        type: int = _socket_module.SOCK_STREAM,  # noqa: A002
+        proto: int = 0,
+    ) -> tuple[_socket_module.socket, _socket_module.socket]:
         """socketpair() that temporarily restores the real socket class.
 
         pytest-socket patches socket.socket with GuardedSocket. asyncio's
         ProactorEventLoop needs socket.socket subclasses (for weakrefs), so
         we can't use _socket.socket directly. Instead, swap back the real
         socket class for the duration of the pair creation.
-        """
-        import socket
 
-        guarded = socket.socket
-        socket.socket = _RealSocket
+        Returns:
+            The connected ``(server, client)`` socket pair.
+        """
+        guarded = _socket_module.socket
+        _socket_module.socket = _RealSocket  # type: ignore[misc]
         try:
-            listener = socket.socket(family, type, proto)
+            listener = _socket_module.socket(family, type, proto)
             try:
                 listener.bind(("127.0.0.1", 0))
                 listener.listen(1)
-                client = socket.socket(family, type, proto)
+                client = _socket_module.socket(family, type, proto)
                 try:
                     client.connect(listener.getsockname())
                     server, _ = listener.accept()
@@ -48,7 +48,7 @@ if sys.platform == "win32":
             finally:
                 listener.close()
         finally:
-            socket.socket = guarded
+            _socket_module.socket = guarded  # type: ignore[misc]
         return server, client
 
     _socket_module.socketpair = _socketpair_win
